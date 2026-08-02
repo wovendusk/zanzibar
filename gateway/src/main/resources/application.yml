@@ -1,0 +1,34 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: zanzibar-gateway
+  cloud:
+    gateway:
+      mvc:
+        routes:
+          - id: acl-tuples
+            uri: http://localhost:8081
+            predicates:
+              - Path=/api/v1/tuples/**
+          - id: acl-check
+            uri: http://localhost:8081
+            predicates:
+              - Path=/api/v1/check/**
+          - id: acl-expand
+            uri: http://localhost:8081
+            predicates:
+              - Path=/api/v1/expand/**
+          - id: leopard-membership
+            uri: http://localhost:8082
+            predicates:
+              - Path=/api/v1/membership/**
+          - id: intelligence-explain
+            uri: http://localhost:8083
+            predicates:
+              - Path=/api/v1/explain/**
+          - id: intelligence-audit
+            uri: http://localhost:8083
+            predicates:
+              - Path=/api/v1/audit/**

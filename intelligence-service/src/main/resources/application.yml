@@ -1,0 +1,28 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: intelligence-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/zanzibar
+    username: zanzibar
+    password: zanzibar
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: intelligence-audit
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "dev.zanzibar.events"
+        spring.json.value.default.type: "dev.zanzibar.events.PermissionChangeEvent"
+
+acl:
+  service:
+    url: http://localhost:8081
