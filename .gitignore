@@ -42,3 +42,5 @@ docs/
 # === Docker volumes (if local) ===
 pgdata/
 kafkadata/
+
+user_response.md
