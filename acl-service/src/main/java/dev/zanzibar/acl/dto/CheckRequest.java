@@ -2,7 +2,12 @@ package dev.zanzibar.acl.dto;
 
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.SubjectRef;
+import dev.zanzibar.model.Zookie;
 
+/**
+ * JSON body for a check. zookieRevision is optional: when present the check
+ * is evaluated at a snapshot at least that fresh.
+ */
 public record CheckRequest(
         String resourceNs,
         String resourceId,
@@ -17,8 +22,11 @@ public record CheckRequest(
     }
 
     public SubjectRef toSubjectRef() {
-        return subjectRel != null
-                ? SubjectRef.userset(subjectNs, subjectId, subjectRel)
-                : SubjectRef.user(subjectNs, subjectId);
+        return new SubjectRef(subjectNs, subjectId, subjectRel);
+    }
+
+    /** The zookie, or null if the caller did not send one. */
+    public Zookie toZookie() {
+        return zookieRevision == null ? null : new Zookie(zookieRevision);
     }
 }

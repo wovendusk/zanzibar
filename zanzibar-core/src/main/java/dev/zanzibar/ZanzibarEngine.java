@@ -1,190 +1,106 @@
 package dev.zanzibar;
 
-import dev.zanzibar.ai.DecisionExplainer;
 import dev.zanzibar.cache.CheckCache;
 import dev.zanzibar.config.NamespaceConfig;
-import dev.zanzibar.consistency.CheckOutcome;
-import dev.zanzibar.consistency.Consistency;
-import dev.zanzibar.consistency.ConsistencyPolicy;
+import dev.zanzibar.config.NamespaceRegistry;
 import dev.zanzibar.engine.CheckEngine;
+import dev.zanzibar.engine.CheckResult;
+import dev.zanzibar.engine.DecisionTrace;
 import dev.zanzibar.engine.ExpandEngine;
+import dev.zanzibar.engine.SnapshotSelector;
 import dev.zanzibar.engine.UsersetTree;
-import dev.zanzibar.leopard.LeopardIndex;
-import dev.zanzibar.leopard.LeopardMembershipService;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.RelationTuple;
 import dev.zanzibar.model.SubjectRef;
 import dev.zanzibar.model.Zookie;
-import dev.zanzibar.store.InMemoryTupleStore;
 import dev.zanzibar.store.TupleStore;
-import dev.zanzibar.trace.TraceCollector;
 
-import java.util.*;
+import java.util.List;
 
 /**
- * Main facade for the Zanzibar authorization engine.
- * Wires together the tuple store, config, check engine, expand engine,
- * cache, and tracing.
+ * The entry point to the authorization engine. It offers the operations of the
+ * Zanzibar API (write, read, check, expand) and connects the parts that
+ * implement them: tuple store, namespace configs, snapshot selection and cache.
  */
 public class ZanzibarEngine {
 
     private final TupleStore store;
-    private final Map<String, NamespaceConfig> configs;
+    private final NamespaceRegistry namespaces;
+    private final SnapshotSelector snapshots;
+    private final CheckCache cache;
     private final CheckEngine checkEngine;
     private final ExpandEngine expandEngine;
-    private final CheckCache cache;
-    private final ConsistencyPolicy policy;
 
-    // Optional Leopard acceleration for group-membership checks (null if disabled).
-    private final String groupNamespace;
-    private final String membershipRelation;
-    private final LeopardIndex leopard;
-    private final LeopardMembershipService membershipService;
-
-    private ZanzibarEngine(TupleStore store, Map<String, NamespaceConfig> configs,
-                           CheckCache cache, ConsistencyPolicy policy,
-                           boolean enableLeopard, String groupNamespace, String membershipRelation) {
+    /**
+     * @param quantum how coarsely checks without a zookie are rounded to a
+     *                shared revision; 1 means every check sees the latest write
+     */
+    public ZanzibarEngine(TupleStore store, NamespaceRegistry namespaces, long quantum) {
         this.store = store;
-        this.configs = configs;
-        this.cache = cache;
-        this.policy = policy;
-        this.checkEngine = new CheckEngine(store, configs, cache, policy);
-        this.expandEngine = new ExpandEngine(store, configs);
-        this.groupNamespace = groupNamespace;
-        this.membershipRelation = membershipRelation;
-        if (enableLeopard) {
-            this.leopard = new LeopardIndex(groupNamespace, membershipRelation);
-            // Fallback is the authoritative engine, reading the store at the exact revision.
-            this.membershipService = new LeopardMembershipService(leopard,
-                    (member, group, atRevision) ->
-                            checkEngine.check(group, membershipRelation, member, new Zookie(atRevision)));
-        } else {
-            this.leopard = null;
-            this.membershipService = null;
-        }
+        this.namespaces = namespaces;
+        this.snapshots = new SnapshotSelector(quantum);
+        this.cache = new CheckCache();
+        this.checkEngine = new CheckEngine(store, namespaces, cache);
+        this.expandEngine = new ExpandEngine(store, namespaces);
     }
 
-    // --- Write operations ---
+    // --- Writes ---
 
     public Zookie write(ObjectRef resource, String relation, SubjectRef subject) {
-        Zookie z = store.write(resource, relation, subject);
-        if (leopard != null) {
-            leopard.applyWrite(resource, relation, subject, z.revision());
-        }
-        return z;
-    }
-
-    public Zookie write(String resourceNs, String resourceId,
-                        String relation,
-                        String subjectNs, String subjectId) {
-        return write(new ObjectRef(resourceNs, resourceId), relation,
-                SubjectRef.user(subjectNs, subjectId));
-    }
-
-    public Zookie writeUserset(String resourceNs, String resourceId,
-                               String relation,
-                               String subjectNs, String subjectId, String subjectRelation) {
-        return write(new ObjectRef(resourceNs, resourceId), relation,
-                SubjectRef.userset(subjectNs, subjectId, subjectRelation));
+        return store.write(resource, relation, subject);
     }
 
     public Zookie delete(ObjectRef resource, String relation, SubjectRef subject) {
-        Zookie z = store.delete(resource, relation, subject);
-        if (leopard != null) {
-            leopard.applyDelete(resource, relation, subject, z.revision());
-        }
-        return z;
+        return store.delete(resource, relation, subject);
     }
 
-    // --- Read operations ---
+    // --- Reads ---
 
-    public List<RelationTuple> read(ObjectRef resource, String relation) {
-        return store.read(resource, relation, store.latestRevision());
-    }
-
-    public List<RelationTuple> read(ObjectRef resource, String relation, Zookie zookie) {
-        return store.read(resource, relation, zookie.revision());
-    }
-
-    // --- Check operations ---
-
-    public boolean check(ObjectRef resource, String relation, SubjectRef subject) {
-        return checkEngine.check(resource, relation, subject,
-                new Zookie(store.latestRevision()));
-    }
-
-    public boolean check(ObjectRef resource, String relation, SubjectRef subject, Zookie zookie) {
-        return checkEngine.check(resource, relation, subject, zookie);
+    /** The stored tuples for (resource, relation); zookie may be null for "latest". */
+    public List<RelationTuple> read(ObjectRef resource, String relation, Zookie atLeastAsFresh) {
+        long latest = store.latestRevision();
+        long revision = atLeastAsFresh == null ? latest : snapshots.select(atLeastAsFresh, latest);
+        return store.read(resource, relation, revision);
     }
 
     /**
-     * Check under an explicit consistency requirement (bounded staleness, exact
-     * snapshot, fully consistent, or minimize latency). Returns the answer plus
-     * the exact revision it was evaluated at.
+     * Check at a snapshot at least as fresh as the zookie. With a null zookie
+     * the engine picks the snapshot itself (see {@link SnapshotSelector}).
      */
-    public CheckOutcome check(ObjectRef resource, String relation, SubjectRef subject,
-                              Consistency consistency) {
-        return checkEngine.check(resource, relation, subject, consistency);
+    public CheckResult check(ObjectRef resource, String relation, SubjectRef subject,
+                             Zookie atLeastAsFresh) {
+        long latest = store.latestRevision();
+        long revision = snapshots.select(atLeastAsFresh, latest);
+        // No check is ever evaluated below the current rounded revision again.
+        cache.evictBefore(snapshots.roundDown(latest));
+        boolean granted = checkEngine.check(resource, relation, subject, revision, null);
+        return new CheckResult(granted, revision, null);
     }
 
-    /**
-     * Check with tracing — returns both the result and the decision trace.
-     */
-    public CheckResult checkWithTrace(ObjectRef resource, String relation,
-                                      SubjectRef subject, Zookie zookie) {
-        TraceCollector trace = new TraceCollector();
-        boolean result = checkEngine.check(resource, relation, subject, zookie, trace);
-        return new CheckResult(result, trace);
+    /** Like check, but also records every step taken, for explaining the decision. */
+    public CheckResult checkWithTrace(ObjectRef resource, String relation, SubjectRef subject,
+                                      Zookie atLeastAsFresh) {
+        long revision = snapshots.select(atLeastAsFresh, store.latestRevision());
+        DecisionTrace trace = new DecisionTrace();
+        boolean granted = checkEngine.check(resource, relation, subject, revision, trace);
+        return new CheckResult(granted, revision, trace.toText());
     }
 
-    /**
-     * Check with tracing and generate an LLM prompt for explaining the decision.
-     */
-    public ExplainedCheck checkAndExplain(ObjectRef resource, String relation,
-                                          SubjectRef subject, Zookie zookie,
-                                          String naturalLanguageQuery) {
-        TraceCollector trace = new TraceCollector();
-        boolean result = checkEngine.check(resource, relation, subject, zookie, trace);
-        var explainer = new DecisionExplainer();
-        var prompt = explainer.buildPrompt(trace, naturalLanguageQuery);
-        return new ExplainedCheck(result, trace, prompt);
+    public UsersetTree expand(ObjectRef resource, String relation, Zookie atLeastAsFresh) {
+        long revision = snapshots.select(atLeastAsFresh, store.latestRevision());
+        return expandEngine.expand(resource, relation, revision);
     }
 
-    // --- Group membership (Leopard-accelerated) ---
+    // --- Namespace configs ---
 
-    /**
-     * Answer a group-membership check under a consistency requirement, using the
-     * Leopard index when it is fresh enough for the resolved revision and falling
-     * back to the authoritative engine otherwise. Requires the engine to have been
-     * built with {@code .enableLeopard()}.
-     */
-    public LeopardMembershipService.Answer membership(SubjectRef member, ObjectRef group,
-                                                      Consistency consistency) {
-        if (membershipService == null) {
-            throw new IllegalStateException("Leopard is not enabled; build with .enableLeopard()");
-        }
-        long required = policy.resolve(consistency, store.safeRevision(), store.latestRevision());
-        return membershipService.isMember(member, group, required);
+    /** Add or replace a namespace config. Cached answers may depend on the old one, so they are dropped. */
+    public void registerNamespace(NamespaceConfig config) {
+        namespaces.register(config);
+        cache.clear();
     }
 
-    public LeopardIndex leopardIndex() {
-        return leopard;
-    }
-
-    // --- Expand ---
-
-    public UsersetTree expand(ObjectRef resource, String relation) {
-        return expandEngine.expand(resource, relation, store.latestRevision());
-    }
-
-    public UsersetTree expand(ObjectRef resource, String relation, Zookie zookie) {
-        return expandEngine.expand(resource, relation, zookie.revision());
-    }
-
-    /** Expand under an explicit consistency requirement (resolves to one snapshot). */
-    public UsersetTree expand(ObjectRef resource, String relation, Consistency consistency) {
-        long rev = policy.resolve(consistency, store.safeRevision(), store.latestRevision());
-        return expandEngine.expand(resource, relation, rev);
+    public List<NamespaceConfig> namespaces() {
+        return namespaces.all();
     }
 
     // --- Accessors ---
@@ -193,85 +109,7 @@ public class ZanzibarEngine {
         return new Zookie(store.latestRevision());
     }
 
-    public CheckCache getCache() {
+    public CheckCache cache() {
         return cache;
-    }
-
-    public TupleStore getStore() {
-        return store;
-    }
-
-    // --- Result types ---
-
-    public record CheckResult(boolean granted, TraceCollector trace) {}
-
-    public record ExplainedCheck(boolean granted, TraceCollector trace,
-                                 DecisionExplainer.PromptPair prompt) {}
-
-    // --- Builder ---
-
-    public static Builder builder() {
-        return new Builder();
-    }
-
-    public static class Builder {
-        private TupleStore store;
-        private final Map<String, NamespaceConfig> configs = new HashMap<>();
-        private boolean enableCache = true;
-        private long quantum = 1;
-        private boolean enableLeopard = false;
-        private String groupNamespace = "group";
-        private String membershipRelation = "member";
-
-        public Builder store(TupleStore store) {
-            this.store = store;
-            return this;
-        }
-
-        public Builder namespace(NamespaceConfig config) {
-            this.configs.put(config.name(), config);
-            return this;
-        }
-
-        public Builder disableCache() {
-            this.enableCache = false;
-            return this;
-        }
-
-        /**
-         * Bucket size for coalescing staleness-tolerant evaluation timestamps.
-         * Larger quantum → more cache reuse, more staleness. Default 1 (no coalescing).
-         */
-        public Builder quantum(long quantum) {
-            this.quantum = quantum;
-            return this;
-        }
-
-        /** Maintain a Leopard membership index (default group namespace "group", relation "member"). */
-        public Builder enableLeopard() {
-            this.enableLeopard = true;
-            return this;
-        }
-
-        /** Maintain a Leopard membership index for a custom group namespace and relation. */
-        public Builder enableLeopard(String groupNamespace, String membershipRelation) {
-            this.enableLeopard = true;
-            this.groupNamespace = groupNamespace;
-            this.membershipRelation = membershipRelation;
-            return this;
-        }
-
-        public ZanzibarEngine build() {
-            if (store == null) {
-                store = new InMemoryTupleStore();
-            }
-            CheckCache cache = enableCache ? new CheckCache() : null;
-            return new ZanzibarEngine(
-                    store,
-                    Collections.unmodifiableMap(new HashMap<>(configs)),
-                    cache,
-                    ConsistencyPolicy.withQuantum(quantum),
-                    enableLeopard, groupNamespace, membershipRelation);
-        }
     }
 }

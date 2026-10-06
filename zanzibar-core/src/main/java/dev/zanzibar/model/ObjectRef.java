@@ -3,8 +3,8 @@ package dev.zanzibar.model;
 import java.util.Objects;
 
 /**
- * A reference to an object in the authorization graph.
- * Examples: ("doc", "readme"), ("folder", "engineering"), ("group", "eng")
+ * An object in the authorization graph, written "namespace:id".
+ * Examples: doc:readme, folder:engineering, group:eng.
  */
 public record ObjectRef(String namespace, String id) {
 

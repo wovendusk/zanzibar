@@ -5,6 +5,10 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 
+/**
+ * Answers group-membership questions from an in-memory index that is kept up
+ * to date from the Kafka stream of tuple changes.
+ */
 @SpringBootApplication
 public class LeopardServiceApplication {
 

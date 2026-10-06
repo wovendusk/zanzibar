@@ -3,56 +3,51 @@ package dev.zanzibar.acl.controller;
 import dev.zanzibar.ZanzibarEngine;
 import dev.zanzibar.acl.dto.TupleRequest;
 import dev.zanzibar.acl.dto.ZookieResponse;
-import dev.zanzibar.acl.kafka.PermissionEventPublisher;
+import dev.zanzibar.acl.service.TupleService;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.RelationTuple;
-import dev.zanzibar.model.SubjectRef;
 import dev.zanzibar.model.Zookie;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 
+/** Write, delete and read relation tuples. */
 @RestController
 @RequestMapping("/api/v1/tuples")
 public class TupleController {
 
+    private final TupleService tuples;
     private final ZanzibarEngine engine;
-    private final PermissionEventPublisher publisher;
 
-    public TupleController(ZanzibarEngine engine, PermissionEventPublisher publisher) {
+    public TupleController(TupleService tuples, ZanzibarEngine engine) {
+        this.tuples = tuples;
         this.engine = engine;
-        this.publisher = publisher;
     }
 
     @PostMapping
-    public ResponseEntity<ZookieResponse> write(@RequestBody TupleRequest req) {
-        ObjectRef resource = req.toObjectRef();
-        SubjectRef subject = req.toSubjectRef();
-        Zookie z = engine.write(resource, req.relation(), subject);
-        publisher.publishWrite(resource, req.relation(), subject, z);
-        return ResponseEntity.ok(new ZookieResponse(z.revision()));
+    public ZookieResponse write(@RequestBody TupleRequest request) {
+        Zookie zookie = tuples.write(request.toObjectRef(), request.relation(), request.toSubjectRef());
+        return new ZookieResponse(zookie.revision());
     }
 
     @DeleteMapping
-    public ResponseEntity<ZookieResponse> delete(@RequestBody TupleRequest req) {
-        ObjectRef resource = req.toObjectRef();
-        SubjectRef subject = req.toSubjectRef();
-        Zookie z = engine.delete(resource, req.relation(), subject);
-        publisher.publishDelete(resource, req.relation(), subject, z);
-        return ResponseEntity.ok(new ZookieResponse(z.revision()));
+    public ZookieResponse delete(@RequestBody TupleRequest request) {
+        Zookie zookie = tuples.delete(request.toObjectRef(), request.relation(), request.toSubjectRef());
+        return new ZookieResponse(zookie.revision());
     }
 
     @GetMapping
-    public ResponseEntity<List<RelationTuple>> read(
-            @RequestParam String resourceNs,
-            @RequestParam String resourceId,
-            @RequestParam String relation,
-            @RequestParam(required = false) Long zookieRevision) {
-        ObjectRef resource = new ObjectRef(resourceNs, resourceId);
-        if (zookieRevision != null) {
-            return ResponseEntity.ok(engine.read(resource, relation, new Zookie(zookieRevision)));
-        }
-        return ResponseEntity.ok(engine.read(resource, relation));
+    public List<RelationTuple> read(@RequestParam String resourceNs,
+                                    @RequestParam String resourceId,
+                                    @RequestParam String relation,
+                                    @RequestParam(required = false) Long zookieRevision) {
+        Zookie zookie = zookieRevision == null ? null : new Zookie(zookieRevision);
+        return engine.read(new ObjectRef(resourceNs, resourceId), relation, zookie);
     }
 }

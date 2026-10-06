@@ -4,6 +4,10 @@ server:
 spring:
   application:
     name: intelligence-service
+  config:
+    # Reads OPENAI_API_KEY from a .env file if there is one, in this directory
+    # or the project root. A real environment variable works as well.
+    import: "optional:file:.env[.properties],optional:file:../.env[.properties]"
   datasource:
     url: jdbc:postgresql://localhost:5432/zanzibar
     username: zanzibar
@@ -17,12 +21,12 @@ spring:
     consumer:
       group-id: intelligence-audit
       auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "dev.zanzibar.events"
-        spring.json.value.default.type: "dev.zanzibar.events.PermissionChangeEvent"
 
 acl:
   service:
     url: http://localhost:8081
+
+openai:
+  base-url: https://api.openai.com/v1
+  api-key: ${OPENAI_API_KEY:}
+  model: gpt-4o-mini

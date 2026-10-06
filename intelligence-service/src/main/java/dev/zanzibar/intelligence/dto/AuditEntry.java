@@ -7,4 +7,5 @@ public record AuditEntry(
         String subjectNs, String subjectId, String subjectRel,
         long revision,
         String timestamp
-) {}
+) {
+}

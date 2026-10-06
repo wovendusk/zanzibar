@@ -1,12 +1,13 @@
 package dev.zanzibar.config;
 
-import java.util.*;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
 
 /**
- * Configuration for a namespace (object type) defining its relations
- * and their rewrite rules.
+ * The configuration of one namespace (object type): its relations and the
+ * rewrite rule of each.
  *
- * Built via the fluent builder API:
  * <pre>
  * NamespaceConfig.builder("doc")
  *     .relation("owner", RewriteRule.thisRelation())
@@ -16,16 +17,16 @@ import java.util.*;
  *     .build();
  * </pre>
  */
-public record NamespaceConfig(String name, Map<String, RelationConfig> relations) {
+public record NamespaceConfig(String name, Map<String, RewriteRule> relations) {
 
     public NamespaceConfig {
         Objects.requireNonNull(name);
-        Objects.requireNonNull(relations);
         relations = Map.copyOf(relations);
     }
 
-    public RelationConfig getRelation(String relationName) {
-        return relations.get(relationName);
+    /** The rewrite rule of a relation, or null if the relation is not configured. */
+    public RewriteRule ruleFor(String relation) {
+        return relations.get(relation);
     }
 
     public static Builder builder(String name) {
@@ -34,14 +35,14 @@ public record NamespaceConfig(String name, Map<String, RelationConfig> relations
 
     public static class Builder {
         private final String name;
-        private final Map<String, RelationConfig> relations = new LinkedHashMap<>();
+        private final Map<String, RewriteRule> relations = new LinkedHashMap<>();
 
         private Builder(String name) {
             this.name = name;
         }
 
-        public Builder relation(String relationName, RewriteRule rewrite) {
-            relations.put(relationName, new RelationConfig(relationName, rewrite));
+        public Builder relation(String relationName, RewriteRule rule) {
+            relations.put(relationName, rule);
             return this;
         }
 

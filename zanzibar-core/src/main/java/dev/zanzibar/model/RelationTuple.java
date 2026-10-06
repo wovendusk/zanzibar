@@ -3,8 +3,8 @@ package dev.zanzibar.model;
 import java.util.Objects;
 
 /**
- * The atomic unit of authorization: object#relation@subject.
- * Example: doc:readme#viewer@user:aritra
+ * The unit of stored authorization data: object#relation@subject.
+ * Example: doc:readme#viewer@user:alice
  */
 public record RelationTuple(ObjectRef resource, String relation, SubjectRef subject) {
 

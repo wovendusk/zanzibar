@@ -10,12 +10,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import java.util.List;
 
 /**
- * PostgreSQL-backed implementation of {@link TupleStore}.
+ * TupleStore backed by one append-only PostgreSQL table.
  *
- * Each write/delete inserts a new row with a revision from a PostgreSQL sequence.
- * Reads use snapshot semantics: find the latest revision ≤ maxRevision for each tuple.
+ * A write inserts a row with active = true; a delete inserts a row with
+ * active = false (a tombstone). Each row takes the next number from a
+ * sequence as its revision. To read "as of revision R", take for each tuple
+ * its newest row with revision <= R and keep it if that row is active.
  */
 public class PostgreSQLTupleStore implements TupleStore {
+
+    private static final String INSERT_SQL = """
+            INSERT INTO tuples (resource_ns, resource_id, relation,
+                                subject_ns, subject_id, subject_rel,
+                                revision, active)
+            VALUES (?, ?, ?, ?, ?, ?, nextval('revision_seq'), ?)
+            RETURNING revision
+            """;
 
     private final JdbcTemplate jdbc;
 
@@ -25,73 +35,51 @@ public class PostgreSQLTupleStore implements TupleStore {
 
     @Override
     public Zookie write(ObjectRef resource, String relation, SubjectRef subject) {
-        Long revision = jdbc.queryForObject(
-                """
-                INSERT INTO tuples (resource_ns, resource_id, relation,
-                                    subject_ns, subject_id, subject_rel,
-                                    revision, active)
-                VALUES (?, ?, ?, ?, ?, ?, nextval('revision_seq'), true)
-                RETURNING revision
-                """,
-                Long.class,
-                resource.namespace(), resource.id(), relation,
-                subject.namespace(), subject.id(), subject.relation());
-        return new Zookie(revision);
+        return insert(resource, relation, subject, true);
     }
 
     @Override
     public Zookie delete(ObjectRef resource, String relation, SubjectRef subject) {
-        Long revision = jdbc.queryForObject(
-                """
-                INSERT INTO tuples (resource_ns, resource_id, relation,
-                                    subject_ns, subject_id, subject_rel,
-                                    revision, active)
-                VALUES (?, ?, ?, ?, ?, ?, nextval('revision_seq'), false)
-                RETURNING revision
-                """,
-                Long.class,
+        return insert(resource, relation, subject, false);
+    }
+
+    private Zookie insert(ObjectRef resource, String relation, SubjectRef subject, boolean active) {
+        Long revision = jdbc.queryForObject(INSERT_SQL, Long.class,
                 resource.namespace(), resource.id(), relation,
-                subject.namespace(), subject.id(), subject.relation());
+                subject.namespace(), subject.id(), subject.relation(),
+                active);
         return new Zookie(revision);
     }
 
     @Override
     public List<RelationTuple> read(ObjectRef resource, String relation, long maxRevision) {
-        return jdbc.query(
-                """
-                SELECT t.resource_ns, t.resource_id, t.relation,
-                       t.subject_ns, t.subject_id, t.subject_rel
-                FROM tuples t
-                INNER JOIN (
-                    SELECT subject_ns, subject_id, COALESCE(subject_rel, '') AS sr,
-                           MAX(revision) AS max_rev
+        // DISTINCT ON keeps, for each subject, the first row in the ORDER BY,
+        // which is that subject's newest row at or below maxRevision.
+        String sql = """
+                SELECT subject_ns, subject_id, subject_rel
+                FROM (
+                    SELECT DISTINCT ON (subject_ns, subject_id, COALESCE(subject_rel, ''))
+                           subject_ns, subject_id, subject_rel, active
                     FROM tuples
                     WHERE resource_ns = ? AND resource_id = ? AND relation = ?
                       AND revision <= ?
-                    GROUP BY subject_ns, subject_id, COALESCE(subject_rel, '')
-                ) latest ON t.subject_ns = latest.subject_ns
-                        AND t.subject_id = latest.subject_id
-                        AND COALESCE(t.subject_rel, '') = latest.sr
-                        AND t.revision = latest.max_rev
-                WHERE t.active = true
-                """,
-                (rs, rowNum) -> {
-                    String subRel = rs.getString("subject_rel");
-                    SubjectRef subject = subRel != null
-                            ? SubjectRef.userset(rs.getString("subject_ns"), rs.getString("subject_id"), subRel)
-                            : SubjectRef.user(rs.getString("subject_ns"), rs.getString("subject_id"));
-                    return new RelationTuple(
-                            new ObjectRef(rs.getString("resource_ns"), rs.getString("resource_id")),
-                            rs.getString("relation"),
-                            subject);
-                },
+                    ORDER BY subject_ns, subject_id, COALESCE(subject_rel, ''), revision DESC
+                ) newest
+                WHERE active = true
+                """;
+        return jdbc.query(sql,
+                (rs, rowNum) -> new RelationTuple(
+                        resource,
+                        relation,
+                        new SubjectRef(rs.getString("subject_ns"),
+                                rs.getString("subject_id"),
+                                rs.getString("subject_rel"))),
                 resource.namespace(), resource.id(), relation, maxRevision);
     }
 
     @Override
     public boolean exists(ObjectRef resource, String relation, SubjectRef subject, long maxRevision) {
-        List<Boolean> results = jdbc.query(
-                """
+        String sql = """
                 SELECT active FROM tuples
                 WHERE resource_ns = ? AND resource_id = ? AND relation = ?
                   AND subject_ns = ? AND subject_id = ?
@@ -99,22 +87,18 @@ public class PostgreSQLTupleStore implements TupleStore {
                   AND revision <= ?
                 ORDER BY revision DESC
                 LIMIT 1
-                """,
+                """;
+        List<Boolean> newest = jdbc.query(sql,
                 (rs, rowNum) -> rs.getBoolean("active"),
                 resource.namespace(), resource.id(), relation,
                 subject.namespace(), subject.id(), subject.relation(),
                 maxRevision);
-        return !results.isEmpty() && results.getFirst();
+        return !newest.isEmpty() && newest.get(0);
     }
 
     @Override
     public long latestRevision() {
-        Long val = jdbc.queryForObject("SELECT COALESCE(MAX(revision), 0) FROM tuples", Long.class);
-        return val != null ? val : 0;
-    }
-
-    @Override
-    public long safeRevision() {
-        return latestRevision();
+        Long latest = jdbc.queryForObject("SELECT COALESCE(MAX(revision), 0) FROM tuples", Long.class);
+        return latest == null ? 0 : latest;
     }
 }

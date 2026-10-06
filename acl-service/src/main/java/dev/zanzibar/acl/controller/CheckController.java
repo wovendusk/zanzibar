@@ -3,13 +3,16 @@ package dev.zanzibar.acl.controller;
 import dev.zanzibar.ZanzibarEngine;
 import dev.zanzibar.acl.dto.CheckRequest;
 import dev.zanzibar.acl.dto.CheckResponse;
-import dev.zanzibar.acl.dto.CheckWithTraceResponse;
 import dev.zanzibar.acl.dto.ExpandRequest;
+import dev.zanzibar.acl.dto.ExplainResponse;
+import dev.zanzibar.engine.CheckResult;
 import dev.zanzibar.engine.UsersetTree;
-import dev.zanzibar.model.Zookie;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
+/** Check, check-with-trace and expand. */
 @RestController
 @RequestMapping("/api/v1")
 public class CheckController {
@@ -21,43 +24,21 @@ public class CheckController {
     }
 
     @PostMapping("/check")
-    public ResponseEntity<CheckResponse> check(@RequestBody CheckRequest req) {
-        boolean granted;
-        long evalRev;
-        if (req.zookieRevision() != null) {
-            Zookie z = new Zookie(req.zookieRevision());
-            granted = engine.check(req.toObjectRef(), req.relation(), req.toSubjectRef(), z);
-            evalRev = z.revision();
-        } else {
-            granted = engine.check(req.toObjectRef(), req.relation(), req.toSubjectRef());
-            evalRev = engine.getStore().latestRevision();
-        }
-        return ResponseEntity.ok(new CheckResponse(granted, evalRev));
+    public CheckResponse check(@RequestBody CheckRequest request) {
+        CheckResult result = engine.check(request.toObjectRef(), request.relation(),
+                request.toSubjectRef(), request.toZookie());
+        return new CheckResponse(result.granted(), result.evaluatedAtRevision());
     }
 
     @PostMapping("/check/explain")
-    public ResponseEntity<CheckWithTraceResponse> checkWithTrace(@RequestBody CheckRequest req) {
-        Zookie z = req.zookieRevision() != null
-                ? new Zookie(req.zookieRevision())
-                : engine.currentZookie();
-        String query = "Can " + req.subjectNs() + ":" + req.subjectId()
-                + " " + req.relation() + " " + req.resourceNs() + ":" + req.resourceId() + "?";
-        var result = engine.checkAndExplain(req.toObjectRef(), req.relation(), req.toSubjectRef(), z, query);
-        return ResponseEntity.ok(new CheckWithTraceResponse(
-                result.granted(),
-                result.trace().toStructuredText(),
-                result.prompt().systemPrompt(),
-                result.prompt().userMessage()));
+    public ExplainResponse explain(@RequestBody CheckRequest request) {
+        CheckResult result = engine.checkWithTrace(request.toObjectRef(), request.relation(),
+                request.toSubjectRef(), request.toZookie());
+        return new ExplainResponse(result.granted(), result.evaluatedAtRevision(), result.trace());
     }
 
     @PostMapping("/expand")
-    public ResponseEntity<UsersetTree> expand(@RequestBody ExpandRequest req) {
-        UsersetTree tree;
-        if (req.zookieRevision() != null) {
-            tree = engine.expand(req.toObjectRef(), req.relation(), new Zookie(req.zookieRevision()));
-        } else {
-            tree = engine.expand(req.toObjectRef(), req.relation());
-        }
-        return ResponseEntity.ok(tree);
+    public UsersetTree expand(@RequestBody ExpandRequest request) {
+        return engine.expand(request.toObjectRef(), request.relation(), request.toZookie());
     }
 }

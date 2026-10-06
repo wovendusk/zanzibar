@@ -6,23 +6,19 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Result of an Expand operation.
- * A tree whose leaves are concrete subjects and whose intermediate nodes
- * represent the set operations used to compute them.
+ * The result of Expand: who holds a relation on an object, and why.
+ *
+ * A node with operation "leaf" lists subjects found directly in tuples.
+ * Any other node combines its children with the named operation
+ * (union, intersection, exclusion).
  */
-public sealed interface UsersetTree {
+public record UsersetTree(String operation, Set<SubjectRef> subjects, List<UsersetTree> children) {
 
-    /** A leaf containing concrete subjects that have the relation. */
-    record Leaf(Set<SubjectRef> subjects) implements UsersetTree {}
-
-    /** An intermediate node representing a set operation. */
-    record Intermediate(String operation, List<UsersetTree> children) implements UsersetTree {}
-
-    static Leaf leaf(Set<SubjectRef> subjects) {
-        return new Leaf(subjects);
+    public static UsersetTree leaf(Set<SubjectRef> subjects) {
+        return new UsersetTree("leaf", subjects, List.of());
     }
 
-    static Intermediate intermediate(String operation, List<UsersetTree> children) {
-        return new Intermediate(operation, children);
+    public static UsersetTree node(String operation, List<UsersetTree> children) {
+        return new UsersetTree(operation, Set.of(), children);
     }
 }

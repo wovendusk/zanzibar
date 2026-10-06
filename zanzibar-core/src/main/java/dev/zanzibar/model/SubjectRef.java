@@ -3,11 +3,11 @@ package dev.zanzibar.model;
 import java.util.Objects;
 
 /**
- * A reference to a subject (user or userset) in the authorization graph.
+ * Who a tuple grants a relation to.
  *
- * When {@code relation} is null, this refers to a specific object (e.g., user:alice).
- * When {@code relation} is non-null, this refers to a userset
- * (e.g., group:eng#member — all members of the eng group).
+ * When relation is null this is a single object, e.g. user:alice.
+ * When relation is set this is a userset, e.g. group:eng#member
+ * ("everyone who is a member of group eng").
  */
 public record SubjectRef(String namespace, String id, String relation) {
 
@@ -21,22 +21,23 @@ public record SubjectRef(String namespace, String id, String relation) {
     }
 
     public static SubjectRef userset(String namespace, String id, String relation) {
-        Objects.requireNonNull(relation, "relation must not be null for userset subjects");
+        Objects.requireNonNull(relation, "relation must not be null for a userset");
         return new SubjectRef(namespace, id, relation);
-    }
-
-    public ObjectRef asObjectRef() {
-        return new ObjectRef(namespace, id);
     }
 
     public boolean isUserset() {
         return relation != null;
     }
 
+    public ObjectRef asObjectRef() {
+        return new ObjectRef(namespace, id);
+    }
+
     @Override
     public String toString() {
-        return relation == null
-                ? namespace + ":" + id
-                : namespace + ":" + id + "#" + relation;
+        if (relation == null) {
+            return namespace + ":" + id;
+        }
+        return namespace + ":" + id + "#" + relation;
     }
 }

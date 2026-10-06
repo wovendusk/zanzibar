@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     subject_ns      TEXT NOT NULL,
     subject_id      TEXT NOT NULL,
     subject_rel     TEXT,
-    revision        BIGINT NOT NULL,
+    revision        BIGINT NOT NULL UNIQUE,
     event_timestamp TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );

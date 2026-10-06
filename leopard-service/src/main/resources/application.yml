@@ -7,10 +7,11 @@ spring:
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
-      group-id: leopard-indexer
+      # A new group on every start, reading from the beginning of the topic:
+      # this is how the in-memory index is rebuilt after a restart.
+      group-id: leopard-${random.uuid}
       auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "dev.zanzibar.events"
-        spring.json.value.default.type: "dev.zanzibar.events.PermissionChangeEvent"
+
+acl:
+  service:
+    url: http://localhost:8081

@@ -22,12 +22,7 @@ subprojects {
         }
     }
 
-    tasks.withType<JavaCompile> {
-        options.compilerArgs.add("--enable-preview")
-    }
-
     tasks.withType<Test> {
         useJUnitPlatform()
-        jvmArgs("--enable-preview", "-Xss4m")
     }
 }

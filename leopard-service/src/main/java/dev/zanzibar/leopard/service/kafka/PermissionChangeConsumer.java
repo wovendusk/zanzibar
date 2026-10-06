@@ -1,5 +1,7 @@
 package dev.zanzibar.leopard.service.kafka;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.zanzibar.events.PermissionChangeEvent;
 import dev.zanzibar.leopard.LeopardIndex;
 import dev.zanzibar.model.ObjectRef;
@@ -10,8 +12,11 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 /**
- * Consumes permission change events from Kafka and feeds them
- * into the in-memory Leopard index.
+ * Reads tuple changes from Kafka and applies them to the index.
+ *
+ * The index only lives in memory, so this service uses a new consumer group
+ * each time it starts (see application.yml) and reads the topic from the
+ * beginning to rebuild it.
  */
 @Component
 public class PermissionChangeConsumer {
@@ -19,28 +24,34 @@ public class PermissionChangeConsumer {
     private static final Logger log = LoggerFactory.getLogger(PermissionChangeConsumer.class);
 
     private final LeopardIndex index;
+    private final ObjectMapper json;
 
-    public PermissionChangeConsumer(LeopardIndex index) {
+    public PermissionChangeConsumer(LeopardIndex index, ObjectMapper json) {
         this.index = index;
+        this.json = json;
     }
 
-    @KafkaListener(topics = "permissions.changes", groupId = "leopard-indexer")
-    public void handleChange(PermissionChangeEvent event) {
-        ObjectRef resource = new ObjectRef(event.resourceNs(), event.resourceId());
-        SubjectRef subject = event.subjectRel() != null
-                ? SubjectRef.userset(event.subjectNs(), event.subjectId(), event.subjectRel())
-                : SubjectRef.user(event.subjectNs(), event.subjectId());
+    @KafkaListener(topics = "permissions.changes")
+    public void onChange(String message) {
+        PermissionChangeEvent event;
+        try {
+            event = json.readValue(message, PermissionChangeEvent.class);
+        } catch (JsonProcessingException e) {
+            log.warn("Skipping a message that is not a valid event: {}", message);
+            return;
+        }
 
-        switch (event.type()) {
-            case "WRITE" -> {
-                index.applyWrite(resource, event.relation(), subject, event.revision());
-                log.debug("Indexed WRITE: {}#{} rev={}", resource, event.relation(), event.revision());
-            }
-            case "DELETE" -> {
-                index.applyDelete(resource, event.relation(), subject, event.revision());
-                log.debug("Indexed DELETE: {}#{} rev={}", resource, event.relation(), event.revision());
-            }
-            default -> log.warn("Unknown event type: {}", event.type());
+        ObjectRef resource = new ObjectRef(event.resourceNs(), event.resourceId());
+        SubjectRef subject = new SubjectRef(event.subjectNs(), event.subjectId(), event.subjectRel());
+
+        // Applying the same event twice leaves the index unchanged, so a
+        // message that Kafka delivers again does no harm.
+        if (PermissionChangeEvent.WRITE.equals(event.type())) {
+            index.applyWrite(resource, event.relation(), subject, event.revision());
+        } else if (PermissionChangeEvent.DELETE.equals(event.type())) {
+            index.applyDelete(resource, event.relation(), subject, event.revision());
+        } else {
+            log.warn("Unknown event type: {}", event.type());
         }
     }
 }

@@ -1,9 +1,9 @@
 package dev.zanzibar.events;
 
 /**
- * Kafka event published on every tuple write or delete.
- * Consumed by the Leopard service (index updates) and
- * the Intelligence service (audit log).
+ * The message published to Kafka for every tuple write or delete.
+ * It travels as JSON. The Leopard service uses it to update its index and the
+ * intelligence service stores it in the audit log.
  */
 public record PermissionChangeEvent(
         String type,            // "WRITE" or "DELETE"
@@ -12,23 +12,10 @@ public record PermissionChangeEvent(
         String relation,
         String subjectNs,
         String subjectId,
-        String subjectRel,      // nullable — null for direct users
+        String subjectRel,      // null for a plain user
         long revision,
         long timestamp
 ) {
-    public static PermissionChangeEvent write(String resourceNs, String resourceId,
-                                              String relation, String subjectNs,
-                                              String subjectId, String subjectRel,
-                                              long revision) {
-        return new PermissionChangeEvent("WRITE", resourceNs, resourceId, relation,
-                subjectNs, subjectId, subjectRel, revision, System.currentTimeMillis());
-    }
-
-    public static PermissionChangeEvent delete(String resourceNs, String resourceId,
-                                               String relation, String subjectNs,
-                                               String subjectId, String subjectRel,
-                                               long revision) {
-        return new PermissionChangeEvent("DELETE", resourceNs, resourceId, relation,
-                subjectNs, subjectId, subjectRel, revision, System.currentTimeMillis());
-    }
+    public static final String WRITE = "WRITE";
+    public static final String DELETE = "DELETE";
 }

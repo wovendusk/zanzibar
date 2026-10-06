@@ -3,8 +3,10 @@ package dev.zanzibar.intelligence.controller;
 import dev.zanzibar.intelligence.dto.ExplainRequest;
 import dev.zanzibar.intelligence.dto.ExplainResponse;
 import dev.zanzibar.intelligence.service.ExplainService;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/explain")
@@ -17,9 +19,7 @@ public class ExplainController {
     }
 
     @PostMapping
-    public ResponseEntity<ExplainResponse> explain(@RequestBody ExplainRequest req) {
-        return ResponseEntity.ok(explainService.explain(
-                req.resourceNs(), req.resourceId(), req.relation(),
-                req.subjectNs(), req.subjectId(), req.subjectRel()));
+    public ExplainResponse explain(@RequestBody ExplainRequest request) {
+        return explainService.explain(request);
     }
 }

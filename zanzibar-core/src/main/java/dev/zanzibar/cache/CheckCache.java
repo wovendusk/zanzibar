@@ -1,88 +1,70 @@
 package dev.zanzibar.cache;
 
-import dev.zanzibar.model.ObjectRef;
-import dev.zanzibar.model.SubjectRef;
-
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.LongAdder;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 
 /**
- * Snapshot-exact check result cache.
+ * Cache of check results, keyed by the question and the revision it was
+ * evaluated at.
  *
- * <p>An entry is keyed by (resource, relation, subject, <b>revision</b>) and is
- * only returned for a lookup at that exact revision. Because tuple history is
- * append-only, the state at a fixed revision is immutable forever, so a cached
- * result at revision R is a permanently-valid answer for any check evaluating at
- * R — and never a valid answer at any other revision. That exactness is what
- * keeps the cache from leaking a grant across a revocation.
+ * The store is append-only, so the data visible at a given revision never
+ * changes. An answer computed at revision R is therefore correct for R forever
+ * and there is nothing to invalidate; a revoke creates a new revision, and
+ * checks at that revision use different keys. Old revisions are evicted once
+ * no check can be evaluated at them any more.
  *
- * <p>The cache is only <em>useful</em> because {@code ConsistencyPolicy} coalesces
- * staleness-tolerant checks onto shared evaluation revisions (quantization): many
- * distinct requests resolve to the same R, hit the same key, and reuse the result.
- * Hit/miss counters here let the hit-rate benefit be measured, not just asserted.
+ * Many request threads use the cache at once, so every method is synchronized.
  */
 public class CheckCache {
 
-    private final ConcurrentHashMap<CheckCacheKey, Boolean> cache = new ConcurrentHashMap<>();
-    private final LongAdder hits = new LongAdder();
-    private final LongAdder misses = new LongAdder();
+    private final Map<CheckCacheKey, Boolean> entries = new HashMap<>();
+    private long evictedBefore = 0;
+    private long hits = 0;
+    private long misses = 0;
 
-    /** Look up a result computed at exactly {@code atRevision}. */
-    public Optional<Boolean> lookup(ObjectRef resource, String relation,
-                                    SubjectRef subject, long atRevision) {
-        Boolean result = cache.get(CheckCacheKey.of(resource, relation, subject, atRevision));
-        if (result != null) {
-            hits.increment();
-            return Optional.of(result);
+    /** The cached answer, or null if there is none. */
+    public synchronized Boolean lookup(CheckCacheKey key) {
+        Boolean result = entries.get(key);
+        if (result == null) {
+            misses++;
+        } else {
+            hits++;
         }
-        misses.increment();
-        return Optional.empty();
+        return result;
     }
 
-    /** Store a result computed at {@code revision}. */
-    public void store(ObjectRef resource, String relation,
-                      SubjectRef subject, boolean result, long revision) {
-        cache.put(CheckCacheKey.of(resource, relation, subject, revision), result);
+    public synchronized void store(CheckCacheKey key, boolean result) {
+        entries.put(key, result);
     }
 
-    /**
-     * Drop entries computed at a revision strictly older than {@code cutoffRevision}.
-     * Called with a quantum boundary to bound cache size — old snapshots are no
-     * longer worth reusing once every live request coalesces onto newer buckets.
-     */
-    public void evictBefore(long cutoffRevision) {
-        cache.keySet().removeIf(key -> key.revision() < cutoffRevision);
+    /** Drop every entry computed at a revision older than cutoffRevision. */
+    public synchronized void evictBefore(long cutoffRevision) {
+        if (cutoffRevision <= evictedBefore) {
+            return; // already done
+        }
+        Iterator<CheckCacheKey> keys = entries.keySet().iterator();
+        while (keys.hasNext()) {
+            if (keys.next().revision() < cutoffRevision) {
+                keys.remove();
+            }
+        }
+        evictedBefore = cutoffRevision;
     }
 
-    // --- Metrics ---
-
-    public long hitCount() {
-        return hits.sum();
+    public synchronized void clear() {
+        entries.clear();
     }
 
-    public long missCount() {
-        return misses.sum();
+    public synchronized int size() {
+        return entries.size();
     }
 
-    /** Fraction of lookups that hit, in [0, 1]; 0 when there have been no lookups. */
-    public double hitRate() {
-        long h = hits.sum();
-        long total = h + misses.sum();
-        return total == 0 ? 0.0 : (double) h / total;
+    public synchronized long hitCount() {
+        return hits;
     }
 
-    public void resetMetrics() {
-        hits.reset();
-        misses.reset();
-    }
-
-    public int size() {
-        return cache.size();
-    }
-
-    public void clear() {
-        cache.clear();
-        resetMetrics();
+    public synchronized long missCount() {
+        return misses;
     }
 }

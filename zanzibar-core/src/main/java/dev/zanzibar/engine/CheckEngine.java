@@ -1,150 +1,138 @@
 package dev.zanzibar.engine;
 
 import dev.zanzibar.cache.CheckCache;
+import dev.zanzibar.cache.CheckCacheKey;
 import dev.zanzibar.config.NamespaceConfig;
-import dev.zanzibar.config.RelationConfig;
+import dev.zanzibar.config.NamespaceRegistry;
 import dev.zanzibar.config.RewriteRule;
-import dev.zanzibar.consistency.CheckOutcome;
-import dev.zanzibar.consistency.Consistency;
-import dev.zanzibar.consistency.ConsistencyPolicy;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.RelationTuple;
 import dev.zanzibar.model.SubjectRef;
-import dev.zanzibar.model.Zookie;
 import dev.zanzibar.store.TupleStore;
-import dev.zanzibar.trace.TraceCollector;
 
-import java.util.*;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
- * The core check algorithm. Evaluates whether a subject has a given relation
- * to a resource, walking the rewrite rule tree and the tuple graph.
+ * Answers "does this subject have this relation on this object?" at one revision.
+ *
+ * The answer is found by walking two things together: the rewrite rule of the
+ * relation (union, intersection, exclusion, ...) and the stored tuples
+ * (group memberships, parent folders, ...). Each step may lead to another
+ * check on a different object or relation, so the walk is recursive.
  */
 public class CheckEngine {
 
     private final TupleStore store;
-    private final Map<String, NamespaceConfig> configs;
-    private final CheckCache cache;
-    private final ConsistencyPolicy policy;
+    private final NamespaceRegistry namespaces;
+    private final CheckCache cache; // null when caching is off
 
-    public CheckEngine(TupleStore store, Map<String, NamespaceConfig> configs,
-                       CheckCache cache, ConsistencyPolicy policy) {
-        this.store = Objects.requireNonNull(store);
-        this.configs = Objects.requireNonNull(configs);
+    public CheckEngine(TupleStore store, NamespaceRegistry namespaces, CheckCache cache) {
+        this.store = store;
+        this.namespaces = namespaces;
         this.cache = cache;
-        this.policy = policy != null ? policy : ConsistencyPolicy.noQuantization();
     }
 
-    public CheckEngine(TupleStore store, Map<String, NamespaceConfig> configs, CheckCache cache) {
-        this(store, configs, cache, null);
-    }
+    /** The state of one top-level check, shared by all its recursive steps. */
+    private static class Run {
+        final long revision;
+        final DecisionTrace trace;      // null when no trace was asked for
+        final boolean useCache;
+        final Set<CheckCacheKey> inProgress = new HashSet<>();
+        boolean cycleCut = false;
 
-    public CheckEngine(TupleStore store, Map<String, NamespaceConfig> configs) {
-        this(store, configs, null, null);
-    }
+        Run(long revision, DecisionTrace trace, boolean useCache) {
+            this.revision = revision;
+            this.trace = trace;
+            this.useCache = useCache;
+        }
 
-    // --- Consistency-aware API ---
+        void note(String step) {
+            if (trace != null) {
+                trace.add(step);
+            }
+        }
+    }
 
     /**
-     * Check under an explicit consistency requirement. Resolves the requirement to
-     * a single evaluation revision, evaluates the whole recursive check at that
-     * snapshot, and reports both the answer and the revision it was evaluated at.
+     * @param revision the snapshot to evaluate at; every read in the walk uses it
+     * @param trace    collects the steps taken, or null if not wanted. A traced
+     *                 check skips the cache so that the trace shows every step.
      */
-    public CheckOutcome check(ObjectRef resource, String relation, SubjectRef subject,
-                              Consistency consistency, TraceCollector trace) {
-        long evalRevision = policy.resolve(consistency, store.safeRevision(), store.latestRevision());
-        // The resolved revision is the effective snapshot for the entire recursion;
-        // every recursive read and every cache access uses exactly this revision.
-        Zookie effective = new Zookie(evalRevision);
-        boolean result = checkInternal(resource, relation, subject, effective, new HashSet<>(), trace);
-        if (trace != null) {
-            trace.recordResult(resource, relation, subject, result);
-        }
-        return new CheckOutcome(result, evalRevision);
-    }
-
-    public CheckOutcome check(ObjectRef resource, String relation, SubjectRef subject,
-                              Consistency consistency) {
-        return check(resource, relation, subject, consistency, null);
-    }
-
-    // --- Zookie convenience API (exact-snapshot semantics) ---
-
-    /** Check at exactly the zookie's revision (no tracing). */
-    public boolean check(ObjectRef resource, String relation, SubjectRef subject, Zookie zookie) {
-        return check(resource, relation, subject, zookie, null);
-    }
-
-    /** Check at exactly the zookie's revision, with optional tracing. */
     public boolean check(ObjectRef resource, String relation, SubjectRef subject,
-                         Zookie zookie, TraceCollector trace) {
-        return check(resource, relation, subject, new Consistency.AtExactSnapshot(zookie), trace).granted();
+                         long revision, DecisionTrace trace) {
+        Run run = new Run(revision, trace, cache != null && trace == null);
+        boolean granted = checkRelation(resource, relation, subject, run);
+        run.note("RESULT: " + subject + (granted ? " HAS " : " DOES NOT HAVE ")
+                + relation + " on " + resource);
+        return granted;
     }
 
-    private boolean checkInternal(ObjectRef resource, String relation, SubjectRef subject,
-                                  Zookie zookie, Set<CheckKey> visited, TraceCollector trace) {
-        var key = new CheckKey(resource, relation, subject);
-        if (!visited.add(key)) {
+    private boolean checkRelation(ObjectRef resource, String relation, SubjectRef subject, Run run) {
+        CheckCacheKey key = new CheckCacheKey(resource, relation, subject, run.revision);
+
+        // Groups can contain each other, so the walk can come back to a question
+        // it is still in the middle of answering. That branch cannot add anything.
+        if (run.inProgress.contains(key)) {
+            run.cycleCut = true;
+            run.note("Already checking " + resource + "#" + relation + " (cycle), skipping this branch");
             return false;
         }
 
-        long rev = zookie.revision();
-
-        if (cache != null) {
-            var cached = cache.lookup(resource, relation, subject, rev);
-            if (cached.isPresent()) {
-                if (trace != null) {
-                    trace.recordCacheHit(resource, relation, subject, cached.get());
-                }
-                return cached.get();
+        if (run.useCache) {
+            Boolean cached = cache.lookup(key);
+            if (cached != null) {
+                return cached;
             }
         }
 
-        NamespaceConfig nsConfig = configs.get(resource.namespace());
+        run.inProgress.add(key);
         boolean result;
-
-        if (nsConfig == null) {
-            result = directCheck(resource, relation, subject, zookie, visited, trace);
+        RewriteRule rule = ruleFor(resource.namespace(), relation);
+        if (rule == null) {
+            // No config for this relation: only directly stored tuples count.
+            result = checkDirect(resource, relation, subject, run);
         } else {
-            RelationConfig relConfig = nsConfig.getRelation(relation);
-            if (relConfig == null) {
-                result = directCheck(resource, relation, subject, zookie, visited, trace);
-            } else {
-                result = evaluate(relConfig.rewrite(), resource, relation, subject, zookie, visited, trace);
-            }
+            result = evaluate(rule, resource, relation, subject, run);
         }
+        run.inProgress.remove(key);
 
-        if (cache != null) {
-            cache.store(resource, relation, subject, result, rev);
+        // A result computed after a cycle was cut may be incomplete, so only
+        // results from cycle-free walks are safe to share with other checks.
+        if (run.useCache && !run.cycleCut) {
+            cache.store(key, result);
         }
-
         return result;
     }
 
-    private boolean evaluate(RewriteRule rule, ObjectRef resource, String relation,
-                             SubjectRef subject, Zookie zookie, Set<CheckKey> visited,
-                             TraceCollector trace) {
-        return switch (rule) {
-            case RewriteRule.This t ->
-                directCheck(resource, relation, subject, zookie, visited, trace);
+    private RewriteRule ruleFor(String namespace, String relation) {
+        NamespaceConfig config = namespaces.get(namespace);
+        if (config == null) {
+            return null;
+        }
+        return config.ruleFor(relation);
+    }
 
-            case RewriteRule.ComputedUserset cu -> {
-                if (trace != null) {
-                    trace.recordComputedUserset(resource, relation, cu.relation());
-                }
-                yield checkInternal(resource, cu.relation(), subject, zookie, visited, trace);
+    private boolean evaluate(RewriteRule rule, ObjectRef resource, String relation,
+                             SubjectRef subject, Run run) {
+        return switch (rule) {
+            case RewriteRule.This self -> checkDirect(resource, relation, subject, run);
+
+            case RewriteRule.ComputedUserset computed -> {
+                run.note("Everyone with " + computed.relation() + " on " + resource
+                        + " also has " + relation + "; checking " + computed.relation());
+                yield checkRelation(resource, computed.relation(), subject, run);
             }
 
             case RewriteRule.TupleToUserset ttu -> {
-                List<RelationTuple> parents = store.read(resource, ttu.tuplesetRelation(), zookie.revision());
                 boolean found = false;
-                for (RelationTuple parentTuple : parents) {
-                    ObjectRef parent = parentTuple.subject().asObjectRef();
-                    if (trace != null) {
-                        trace.recordTupleToUserset(resource, ttu.tuplesetRelation(),
-                                parent, ttu.computedRelation());
-                    }
-                    if (checkInternal(parent, ttu.computedRelation(), subject, zookie, visited, trace)) {
+                List<RelationTuple> links = store.read(resource, ttu.tuplesetRelation(), run.revision);
+                for (RelationTuple link : links) {
+                    ObjectRef target = link.subject().asObjectRef();
+                    run.note(resource + " has " + ttu.tuplesetRelation() + " " + target
+                            + "; checking " + ttu.computedRelation() + " there");
+                    if (checkRelation(target, ttu.computedRelation(), subject, run)) {
                         found = true;
                         break;
                     }
@@ -152,13 +140,11 @@ public class CheckEngine {
                 yield found;
             }
 
-            case RewriteRule.Union u -> {
-                if (trace != null) {
-                    trace.recordSetOperation("union", resource, relation);
-                }
+            case RewriteRule.Union union -> {
+                run.note("Rule for " + resource + "#" + relation + " is a union: any branch may grant");
                 boolean any = false;
-                for (RewriteRule child : u.children()) {
-                    if (evaluate(child, resource, relation, subject, zookie, visited, trace)) {
+                for (RewriteRule child : union.children()) {
+                    if (evaluate(child, resource, relation, subject, run)) {
                         any = true;
                         break;
                     }
@@ -166,13 +152,11 @@ public class CheckEngine {
                 yield any;
             }
 
-            case RewriteRule.Intersection inter -> {
-                if (trace != null) {
-                    trace.recordSetOperation("intersection", resource, relation);
-                }
+            case RewriteRule.Intersection intersection -> {
+                run.note("Rule for " + resource + "#" + relation + " is an intersection: every branch must grant");
                 boolean all = true;
-                for (RewriteRule child : inter.children()) {
-                    if (!evaluate(child, resource, relation, subject, zookie, visited, trace)) {
+                for (RewriteRule child : intersection.children()) {
+                    if (!evaluate(child, resource, relation, subject, run)) {
                         all = false;
                         break;
                     }
@@ -180,49 +164,36 @@ public class CheckEngine {
                 yield all;
             }
 
-            case RewriteRule.Exclusion ex -> {
-                if (trace != null) {
-                    trace.recordSetOperation("exclusion", resource, relation);
-                }
-                yield evaluate(ex.base(), resource, relation, subject, zookie, visited, trace) &&
-                      !evaluate(ex.subtract(), resource, relation, subject, zookie, visited, trace);
+            case RewriteRule.Exclusion exclusion -> {
+                run.note("Rule for " + resource + "#" + relation
+                        + " is an exclusion: the first branch must grant and the second must not");
+                boolean inBase = evaluate(exclusion.base(), resource, relation, subject, run);
+                yield inBase && !evaluate(exclusion.subtract(), resource, relation, subject, run);
             }
         };
     }
 
-    private boolean directCheck(ObjectRef resource, String relation, SubjectRef subject,
-                                Zookie zookie, Set<CheckKey> visited, TraceCollector trace) {
-        long rev = zookie.revision();
-
-        if (store.exists(resource, relation, subject, rev)) {
-            if (trace != null) {
-                trace.recordDirectCheck(resource, relation, subject, true);
-            }
+    /** Looks only at tuples stored for exactly this object and relation. */
+    private boolean checkDirect(ObjectRef resource, String relation, SubjectRef subject, Run run) {
+        if (store.exists(resource, relation, subject, run.revision)) {
+            run.note("Found stored tuple " + resource + "#" + relation + "@" + subject);
             return true;
         }
 
-        List<RelationTuple> tuples = store.read(resource, relation, rev);
+        // The subject may be included through a userset such as group:eng#member.
+        List<RelationTuple> tuples = store.read(resource, relation, run.revision);
         for (RelationTuple tuple : tuples) {
-            SubjectRef tupleSubject = tuple.subject();
-            if (tupleSubject.isUserset()) {
-                if (trace != null) {
-                    trace.recordGroupIndirection(resource, relation, tupleSubject, subject, false);
-                }
-                if (checkInternal(tupleSubject.asObjectRef(), tupleSubject.relation(),
-                        subject, zookie, visited, trace)) {
-                    if (trace != null) {
-                        trace.recordGroupIndirection(resource, relation, tupleSubject, subject, true);
-                    }
+            SubjectRef granted = tuple.subject();
+            if (granted.isUserset()) {
+                run.note(resource + "#" + relation + " is granted to " + granted
+                        + "; checking whether " + subject + " belongs to it");
+                if (checkRelation(granted.asObjectRef(), granted.relation(), subject, run)) {
                     return true;
                 }
             }
         }
 
-        if (trace != null) {
-            trace.recordDirectCheck(resource, relation, subject, false);
-        }
+        run.note("No stored tuple gives " + subject + " " + relation + " on " + resource);
         return false;
     }
-
-    private record CheckKey(ObjectRef resource, String relation, SubjectRef subject) {}
 }

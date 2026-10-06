@@ -8,42 +8,26 @@ import dev.zanzibar.model.Zookie;
 import java.util.List;
 
 /**
- * Storage layer for relation tuples.
- * All mutating operations return a {@link Zookie} encoding the revision at which
- * the mutation was applied.
+ * Append-only storage of relation tuples.
+ *
+ * Nothing is ever updated or removed. A write appends the tuple at a new
+ * revision; a delete appends a tombstone at a new revision. Reads name a
+ * revision and see the store exactly as it was at that point.
  */
 public interface TupleStore {
 
-    /** Write a tuple and return the assigned revision as a zookie. */
+    /** Append a tuple. Returns the revision it was written at. */
     Zookie write(ObjectRef resource, String relation, SubjectRef subject);
 
-    /**
-     * Soft-delete a tuple by writing a tombstone.
-     * Returns the revision of the tombstone.
-     */
+    /** Append a tombstone for a tuple. Returns the revision of the tombstone. */
     Zookie delete(ObjectRef resource, String relation, SubjectRef subject);
 
-    /**
-     * Read all active tuples for a given (resource, relation) as of maxRevision.
-     * Tombstoned tuples are excluded.
-     */
+    /** All tuples for (resource, relation) that are live as of maxRevision. */
     List<RelationTuple> read(ObjectRef resource, String relation, long maxRevision);
 
-    /**
-     * Check whether a specific tuple is active as of maxRevision.
-     */
+    /** Whether one specific tuple is live as of maxRevision. */
     boolean exists(ObjectRef resource, String relation, SubjectRef subject, long maxRevision);
 
-    /** Return the current (highest) revision number. */
+    /** The highest revision written so far (0 if the store is empty). */
     long latestRevision();
-
-    /**
-     * The highest revision guaranteed durable / replicated everywhere — the
-     * freshest snapshot a staleness-tolerant read may use without a leader read.
-     * Defaults to {@link #latestRevision()} (synchronous single-node replication);
-     * a store that models replication lag returns a value that trails it.
-     */
-    default long safeRevision() {
-        return latestRevision();
-    }
 }

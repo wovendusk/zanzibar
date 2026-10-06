@@ -44,3 +44,7 @@ pgdata/
 kafkadata/
 
 user_response.md
+
+# === Local key drop file ===
+api_keys.txt
+api_key.txt

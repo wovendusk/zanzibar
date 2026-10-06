@@ -15,7 +15,9 @@ spring:
   kafka:
     bootstrap-servers: localhost:9092
     producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-      properties:
-        spring.json.type.mapping: "event:dev.zanzibar.events.PermissionChangeEvent"
+      acks: all
+
+zanzibar:
+  # Checks without a zookie are evaluated at the latest revision rounded down
+  # to a multiple of this number. 1 = always the latest revision.
+  quantum: 1

@@ -3,6 +3,7 @@ package dev.zanzibar.acl.dto;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.SubjectRef;
 
+/** JSON body for writing or deleting a tuple. subjectRel is omitted for a plain user. */
 public record TupleRequest(
         String resourceNs,
         String resourceId,
@@ -16,8 +17,6 @@ public record TupleRequest(
     }
 
     public SubjectRef toSubjectRef() {
-        return subjectRel != null
-                ? SubjectRef.userset(subjectNs, subjectId, subjectRel)
-                : SubjectRef.user(subjectNs, subjectId);
+        return new SubjectRef(subjectNs, subjectId, subjectRel);
     }
 }

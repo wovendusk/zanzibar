@@ -2,8 +2,10 @@ package dev.zanzibar.intelligence.controller;
 
 import dev.zanzibar.intelligence.dto.AuditEntry;
 import dev.zanzibar.intelligence.service.AuditService;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 
@@ -18,18 +20,16 @@ public class AuditController {
     }
 
     @GetMapping("/resource")
-    public ResponseEntity<List<AuditEntry>> byResource(
-            @RequestParam String resourceNs,
-            @RequestParam String resourceId,
-            @RequestParam(defaultValue = "50") int limit) {
-        return ResponseEntity.ok(auditService.findByResource(resourceNs, resourceId, limit));
+    public List<AuditEntry> byResource(@RequestParam String resourceNs,
+                                       @RequestParam String resourceId,
+                                       @RequestParam(defaultValue = "50") int limit) {
+        return auditService.findByResource(resourceNs, resourceId, limit);
     }
 
     @GetMapping("/subject")
-    public ResponseEntity<List<AuditEntry>> bySubject(
-            @RequestParam String subjectNs,
-            @RequestParam String subjectId,
-            @RequestParam(defaultValue = "50") int limit) {
-        return ResponseEntity.ok(auditService.findBySubject(subjectNs, subjectId, limit));
+    public List<AuditEntry> bySubject(@RequestParam String subjectNs,
+                                      @RequestParam String subjectId,
+                                      @RequestParam(defaultValue = "50") int limit) {
+        return auditService.findBySubject(subjectNs, subjectId, limit);
     }
 }

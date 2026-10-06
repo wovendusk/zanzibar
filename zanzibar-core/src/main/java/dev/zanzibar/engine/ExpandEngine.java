@@ -1,124 +1,134 @@
 package dev.zanzibar.engine;
 
 import dev.zanzibar.config.NamespaceConfig;
-import dev.zanzibar.config.RelationConfig;
+import dev.zanzibar.config.NamespaceRegistry;
 import dev.zanzibar.config.RewriteRule;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.RelationTuple;
 import dev.zanzibar.model.SubjectRef;
 import dev.zanzibar.store.TupleStore;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
- * Computes the full userset tree for a given (resource, relation).
- * Unlike Read (which returns raw tuples), Expand evaluates rewrite rules
- * and returns the computed set of all effective subjects.
+ * Answers "who has this relation on this object?" as a tree.
+ * It walks the same rules and tuples as the check engine, but instead of
+ * stopping at the first grant it collects everything it finds.
  */
 public class ExpandEngine {
 
     private final TupleStore store;
-    private final Map<String, NamespaceConfig> configs;
+    private final NamespaceRegistry namespaces;
 
-    public ExpandEngine(TupleStore store, Map<String, NamespaceConfig> configs) {
-        this.store = Objects.requireNonNull(store);
-        this.configs = Objects.requireNonNull(configs);
+    public ExpandEngine(TupleStore store, NamespaceRegistry namespaces) {
+        this.store = store;
+        this.namespaces = namespaces;
     }
 
-    public UsersetTree expand(ObjectRef resource, String relation, long maxRevision) {
-        return expandInternal(resource, relation, maxRevision, new HashSet<>());
+    public UsersetTree expand(ObjectRef resource, String relation, long revision) {
+        return expandRelation(resource, relation, revision, new HashSet<>());
     }
 
-    private UsersetTree expandInternal(ObjectRef resource, String relation,
-                                       long maxRevision, Set<ExpandKey> visited) {
-        var key = new ExpandKey(resource, relation);
-        if (!visited.add(key)) {
-            return UsersetTree.leaf(Set.of());
+    private UsersetTree expandRelation(ObjectRef resource, String relation, long revision,
+                                       Set<String> inProgress) {
+        String key = resource + "#" + relation;
+        if (inProgress.contains(key)) {
+            return UsersetTree.leaf(Set.of()); // cycle: nothing new down this branch
+        }
+        inProgress.add(key);
+
+        UsersetTree tree;
+        NamespaceConfig config = namespaces.get(resource.namespace());
+        RewriteRule rule = config == null ? null : config.ruleFor(relation);
+        if (rule == null) {
+            tree = expandDirect(resource, relation, revision, inProgress);
+        } else {
+            tree = expandRule(rule, resource, relation, revision, inProgress);
         }
 
-        NamespaceConfig nsConfig = configs.get(resource.namespace());
-        if (nsConfig == null) {
-            return expandDirect(resource, relation, maxRevision, visited);
-        }
-
-        RelationConfig relConfig = nsConfig.getRelation(relation);
-        if (relConfig == null) {
-            return expandDirect(resource, relation, maxRevision, visited);
-        }
-
-        return expandRule(relConfig.rewrite(), resource, relation, maxRevision, visited);
+        inProgress.remove(key);
+        return tree;
     }
 
     private UsersetTree expandRule(RewriteRule rule, ObjectRef resource, String relation,
-                                   long maxRevision, Set<ExpandKey> visited) {
+                                   long revision, Set<String> inProgress) {
         return switch (rule) {
-            case RewriteRule.This t -> expandDirect(resource, relation, maxRevision, visited);
+            case RewriteRule.This self -> expandDirect(resource, relation, revision, inProgress);
 
-            case RewriteRule.ComputedUserset cu ->
-                expandInternal(resource, cu.relation(), maxRevision, visited);
+            case RewriteRule.ComputedUserset computed ->
+                    expandRelation(resource, computed.relation(), revision, inProgress);
 
             case RewriteRule.TupleToUserset ttu -> {
-                List<RelationTuple> parents = store.read(resource, ttu.tuplesetRelation(), maxRevision);
                 List<UsersetTree> children = new ArrayList<>();
-                for (RelationTuple parentTuple : parents) {
-                    ObjectRef parent = parentTuple.subject().asObjectRef();
-                    children.add(expandInternal(parent, ttu.computedRelation(), maxRevision, visited));
+                for (RelationTuple link : store.read(resource, ttu.tuplesetRelation(), revision)) {
+                    ObjectRef target = link.subject().asObjectRef();
+                    children.add(expandRelation(target, ttu.computedRelation(), revision, inProgress));
                 }
-                yield children.isEmpty()
-                        ? UsersetTree.leaf(Set.of())
-                        : UsersetTree.intermediate("tuple_to_userset", children);
+                yield unionOf(children);
             }
 
-            case RewriteRule.Union u -> {
-                List<UsersetTree> children = u.children().stream()
-                        .map(child -> expandRule(child, resource, relation, maxRevision, visited))
-                        .collect(Collectors.toList());
-                yield UsersetTree.intermediate("union", children);
-            }
+            case RewriteRule.Union union ->
+                    unionOf(expandChildren(union.children(), resource, relation, revision, inProgress));
 
-            case RewriteRule.Intersection inter -> {
-                List<UsersetTree> children = inter.children().stream()
-                        .map(child -> expandRule(child, resource, relation, maxRevision, visited))
-                        .collect(Collectors.toList());
-                yield UsersetTree.intermediate("intersection", children);
-            }
+            case RewriteRule.Intersection intersection ->
+                    UsersetTree.node("intersection",
+                            expandChildren(intersection.children(), resource, relation, revision, inProgress));
 
-            case RewriteRule.Exclusion ex ->
-                UsersetTree.intermediate("exclusion", List.of(
-                        expandRule(ex.base(), resource, relation, maxRevision, visited),
-                        expandRule(ex.subtract(), resource, relation, maxRevision, visited)
-                ));
+            case RewriteRule.Exclusion exclusion ->
+                    UsersetTree.node("exclusion", List.of(
+                            expandRule(exclusion.base(), resource, relation, revision, inProgress),
+                            expandRule(exclusion.subtract(), resource, relation, revision, inProgress)));
         };
     }
 
-    private UsersetTree expandDirect(ObjectRef resource, String relation,
-                                     long maxRevision, Set<ExpandKey> visited) {
-        List<RelationTuple> tuples = store.read(resource, relation, maxRevision);
-        Set<SubjectRef> directSubjects = new LinkedHashSet<>();
-        List<UsersetTree> usersetChildren = new ArrayList<>();
+    private List<UsersetTree> expandChildren(List<RewriteRule> rules, ObjectRef resource, String relation,
+                                             long revision, Set<String> inProgress) {
+        List<UsersetTree> children = new ArrayList<>();
+        for (RewriteRule rule : rules) {
+            children.add(expandRule(rule, resource, relation, revision, inProgress));
+        }
+        return children;
+    }
 
-        for (RelationTuple tuple : tuples) {
+    private UsersetTree expandDirect(ObjectRef resource, String relation, long revision,
+                                     Set<String> inProgress) {
+        Set<SubjectRef> direct = new LinkedHashSet<>();
+        List<UsersetTree> nested = new ArrayList<>();
+
+        for (RelationTuple tuple : store.read(resource, relation, revision)) {
             SubjectRef subject = tuple.subject();
             if (subject.isUserset()) {
-                usersetChildren.add(expandInternal(
-                        subject.asObjectRef(), subject.relation(), maxRevision, visited));
+                nested.add(expandRelation(subject.asObjectRef(), subject.relation(), revision, inProgress));
             } else {
-                directSubjects.add(subject);
+                direct.add(subject);
             }
         }
 
-        if (usersetChildren.isEmpty()) {
-            return UsersetTree.leaf(directSubjects);
-        }
-
-        List<UsersetTree> allChildren = new ArrayList<>();
-        if (!directSubjects.isEmpty()) {
-            allChildren.add(UsersetTree.leaf(directSubjects));
-        }
-        allChildren.addAll(usersetChildren);
-        return UsersetTree.intermediate("direct+groups", allChildren);
+        List<UsersetTree> children = new ArrayList<>();
+        children.add(UsersetTree.leaf(direct));
+        children.addAll(nested);
+        return unionOf(children);
     }
 
-    private record ExpandKey(ObjectRef resource, String relation) {}
+    /** A union node, leaving out branches that found nobody so the tree stays readable. */
+    private UsersetTree unionOf(List<UsersetTree> children) {
+        List<UsersetTree> nonEmpty = new ArrayList<>();
+        for (UsersetTree child : children) {
+            boolean empty = child.subjects().isEmpty() && child.children().isEmpty();
+            if (!empty) {
+                nonEmpty.add(child);
+            }
+        }
+        if (nonEmpty.isEmpty()) {
+            return UsersetTree.leaf(Set.of());
+        }
+        if (nonEmpty.size() == 1) {
+            return nonEmpty.get(0);
+        }
+        return UsersetTree.node("union", nonEmpty);
+    }
 }

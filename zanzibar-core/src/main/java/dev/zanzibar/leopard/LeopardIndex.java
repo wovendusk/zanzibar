@@ -3,111 +3,99 @@ package dev.zanzibar.leopard;
 import dev.zanzibar.model.ObjectRef;
 import dev.zanzibar.model.SubjectRef;
 
+import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * A Leopard-style membership index: an offline, denormalized view that flattens
- * deeply nested group membership so a check becomes a set intersection instead of
- * a recursive walk of the group graph.
+ * A Leopard-style index for group membership.
  *
- * <h2>What it stores</h2>
- * <ul>
- *   <li>A {@link GroupGraph} of group-contains-group edges, with an incrementally
- *       maintained transitive closure per group.</li>
- *   <li>{@code MEMBER2GROUP}: for each concrete member (a user), the set of groups
- *       it is a <em>direct</em> member of.</li>
- * </ul>
- * Transitivity lives entirely on the group side (the closure); the member side is
- * flat. A check joins the two: {@code member ∈ group} iff the member's direct
- * groups intersect the group's closure.
+ * Deciding whether a user is in a deeply nested group normally means walking
+ * the group graph one tuple read at a time. This index flattens the nesting
+ * ahead of time so that the question becomes a lookup in two tables, named as
+ * in the Zanzibar paper:
  *
- * <h2>How it is fed</h2>
- * The index consumes the tuple change-feed via {@link #applyWrite}/{@link #applyDelete}
- * — exactly the model the Zanzibar paper describes (an offline system tailing the
- * write log), rather than scanning storage. It therefore lags the authoritative
- * store slightly; {@link #indexedThrough()} reports how fresh it is, which callers
- * use to decide whether the index may answer a given consistency requirement.
+ *   GROUP2GROUP:  group -> itself and every group nested inside it, at any depth
+ *   MEMBER2GROUP: user  -> the groups the user is a direct member of
  *
- * <h2>Ids</h2>
- * Groups are interned to dense {@code long} ids so closures and member-sets can be
- * represented as {@link SortedIdSet}s and intersected by galloping. Materialized
- * snapshots are cached and lazily rebuilt only when their underlying set changed.
+ * A user is in a group if one of the user's direct groups appears in the
+ * group's GROUP2GROUP set.
+ *
+ * The index is not the source of truth. It is fed the stream of tuple changes
+ * and so runs slightly behind the tuple store. indexedThrough() says how far
+ * it has got; callers use that to decide whether the index is fresh enough.
+ *
+ * The Kafka listener thread updates the index while HTTP request threads read
+ * it, so every public method is synchronized.
  */
-public final class LeopardIndex {
+public class LeopardIndex {
 
     private final String groupNamespace;
     private final String membershipRelation;
 
-    private final GroupGraph graph = new GroupGraph();
+    /** group -> the groups directly nested in it. */
+    private final Map<String, Set<String>> childGroups = new HashMap<>();
 
-    private final Map<String, Long> groupIds = new HashMap<>();
-    private long nextGroupId = 0;
+    /** GROUP2GROUP. Rebuilt from childGroups whenever nesting changes. */
+    private final Map<String, Set<String>> groupToGroups = new HashMap<>();
 
-    /** MEMBER2GROUP: member key ("user:alice") -> direct group ids. */
-    private final Map<String, Set<Long>> directGroupsOfMember = new HashMap<>();
-
-    // Materialized query snapshots, rebuilt lazily when their source set is dirty.
-    private final Map<Long, SortedIdSet> closureSnapshot = new HashMap<>();
-    private final Set<Long> dirtyClosures = new HashSet<>();
-    private final Map<String, SortedIdSet> memberSnapshot = new HashMap<>();
-    private final Set<String> dirtyMembers = new HashSet<>();
+    /** MEMBER2GROUP. */
+    private final Map<String, Set<String>> memberToGroups = new HashMap<>();
 
     private long indexedThrough = 0;
-
-    public LeopardIndex() {
-        this("group", "member");
-    }
 
     public LeopardIndex(String groupNamespace, String membershipRelation) {
         this.groupNamespace = groupNamespace;
         this.membershipRelation = membershipRelation;
     }
 
-    /** The highest revision whose change this index has consumed. */
-    public long indexedThrough() {
+    /** The highest revision whose change has been applied to the index. */
+    public synchronized long indexedThrough() {
         return indexedThrough;
     }
 
-    /** True if this tuple is a group-membership edge the index tracks. */
-    public boolean handles(ObjectRef resource, String relation) {
-        return resource.namespace().equals(groupNamespace) && relation.equals(membershipRelation);
-    }
+    // --- Applying the change stream ---
 
-    // --- Change-feed ingestion ---
-
-    public void applyWrite(ObjectRef resource, String relation, SubjectRef subject, long revision) {
-        if (handles(resource, relation)) {
-            long group = internGroup(resource);
-            if (isSubgroup(subject)) {
-                long child = internGroup(subject.asObjectRef());
-                dirtyClosures.addAll(graph.addEdge(group, child));
-            } else {
-                String key = memberKey(subject);
-                directGroupsOfMember.computeIfAbsent(key, k -> new HashSet<>()).add(group);
-                dirtyMembers.add(key);
+    public synchronized void applyWrite(ObjectRef resource, String relation, SubjectRef subject, long revision) {
+        if (isMembershipTuple(resource, relation)) {
+            String group = resource.toString();
+            if (isNestedGroup(subject)) {
+                String child = subject.asObjectRef().toString();
+                Set<String> children = childGroups.get(group);
+                if (children == null) {
+                    children = new HashSet<>();
+                    childGroups.put(group, children);
+                }
+                children.add(child);
+                rebuildGroupToGroups();
+            } else if (!subject.isUserset()) {
+                String member = subject.toString();
+                Set<String> groups = memberToGroups.get(member);
+                if (groups == null) {
+                    groups = new HashSet<>();
+                    memberToGroups.put(member, groups);
+                }
+                groups.add(group);
             }
         }
         indexedThrough = Math.max(indexedThrough, revision);
     }
 
-    public void applyDelete(ObjectRef resource, String relation, SubjectRef subject, long revision) {
-        if (handles(resource, relation)) {
-            Long group = groupIds.get(groupKey(resource));
-            if (group != null) {
-                if (isSubgroup(subject)) {
-                    Long child = groupIds.get(groupKey(subject.asObjectRef()));
-                    if (child != null) {
-                        dirtyClosures.addAll(graph.removeEdge(group, child));
-                    }
-                } else {
-                    String key = memberKey(subject);
-                    Set<Long> groups = directGroupsOfMember.get(key);
-                    if (groups != null && groups.remove(group)) {
-                        dirtyMembers.add(key);
-                    }
+    public synchronized void applyDelete(ObjectRef resource, String relation, SubjectRef subject, long revision) {
+        if (isMembershipTuple(resource, relation)) {
+            String group = resource.toString();
+            if (isNestedGroup(subject)) {
+                Set<String> children = childGroups.get(group);
+                if (children != null) {
+                    children.remove(subject.asObjectRef().toString());
+                    rebuildGroupToGroups();
+                }
+            } else if (!subject.isUserset()) {
+                Set<String> groups = memberToGroups.get(subject.toString());
+                if (groups != null) {
+                    groups.remove(group);
                 }
             }
         }
@@ -116,69 +104,65 @@ public final class LeopardIndex {
 
     // --- Queries ---
 
-    /** Is {@code member} a (transitive) member of {@code group}, per the current index? */
-    public boolean isMember(SubjectRef member, ObjectRef group) {
-        Long g = groupIds.get(groupKey(group));
-        if (g == null) {
-            return false; // no such group has ever been indexed
-        }
-        SortedIdSet memberGroups = memberSnapshotOf(memberKey(member));
-        if (memberGroups.isEmpty()) {
+    /** Whether member is in group, directly or through nested groups, as far as the index knows. */
+    public synchronized boolean isMember(SubjectRef member, ObjectRef group) {
+        Set<String> directGroups = memberToGroups.get(member.toString());
+        if (directGroups == null) {
             return false;
         }
-        return memberGroups.intersects(closureSnapshotOf(g));
-    }
-
-    /** Is {@code sub} a (transitive) subgroup of {@code group}? */
-    public boolean isSubgroupOf(ObjectRef sub, ObjectRef group) {
-        Long g = groupIds.get(groupKey(group));
-        Long s = groupIds.get(groupKey(sub));
-        if (g == null || s == null) {
-            return false;
+        String groupKey = group.toString();
+        Set<String> reachable = groupToGroups.get(groupKey);
+        if (reachable == null) {
+            // A group with nothing nested in it contains only itself.
+            return directGroups.contains(groupKey);
         }
-        return closureSnapshotOf(g).contains(s);
-    }
-
-    /** Size of a group's flattened closure (incl itself) — useful for benchmarks/inspection. */
-    public int closureSize(ObjectRef group) {
-        Long g = groupIds.get(groupKey(group));
-        return g == null ? 0 : closureSnapshotOf(g).size();
-    }
-
-    // --- Snapshot materialization (lazy, dirty-tracked) ---
-
-    private SortedIdSet closureSnapshotOf(long g) {
-        if (dirtyClosures.remove(g) || !closureSnapshot.containsKey(g)) {
-            closureSnapshot.put(g, SortedIdSet.of(graph.closureOf(g)));
+        for (String direct : directGroups) {
+            if (reachable.contains(direct)) {
+                return true;
+            }
         }
-        return closureSnapshot.get(g);
-    }
-
-    private SortedIdSet memberSnapshotOf(String memberKey) {
-        if (dirtyMembers.remove(memberKey) || !memberSnapshot.containsKey(memberKey)) {
-            Set<Long> groups = directGroupsOfMember.get(memberKey);
-            memberSnapshot.put(memberKey, groups == null ? SortedIdSet.EMPTY : SortedIdSet.of(groups));
-        }
-        return memberSnapshot.get(memberKey);
+        return false;
     }
 
     // --- Helpers ---
 
-    private boolean isSubgroup(SubjectRef subject) {
+    private boolean isMembershipTuple(ObjectRef resource, String relation) {
+        return resource.namespace().equals(groupNamespace) && relation.equals(membershipRelation);
+    }
+
+    /** True for a subject like group:backend#member, i.e. a whole group nested in another. */
+    private boolean isNestedGroup(SubjectRef subject) {
         return subject.isUserset()
                 && subject.namespace().equals(groupNamespace)
                 && membershipRelation.equals(subject.relation());
     }
 
-    private long internGroup(ObjectRef group) {
-        return groupIds.computeIfAbsent(groupKey(group), k -> nextGroupId++);
-    }
-
-    private static String groupKey(ObjectRef group) {
-        return group.namespace() + ":" + group.id();
-    }
-
-    private static String memberKey(SubjectRef subject) {
-        return subject.toString();
+    /**
+     * Recompute GROUP2GROUP from scratch: for every group, find all groups
+     * reachable by following nesting edges (breadth-first search). Group
+     * nesting changes rarely compared with how often membership is checked,
+     * so a full rebuild on each change keeps the code simple.
+     */
+    private void rebuildGroupToGroups() {
+        groupToGroups.clear();
+        for (String group : childGroups.keySet()) {
+            Set<String> reachable = new HashSet<>();
+            ArrayDeque<String> queue = new ArrayDeque<>();
+            reachable.add(group);
+            queue.add(group);
+            while (!queue.isEmpty()) {
+                String current = queue.poll();
+                Set<String> children = childGroups.get(current);
+                if (children == null) {
+                    continue;
+                }
+                for (String child : children) {
+                    if (reachable.add(child)) {
+                        queue.add(child);
+                    }
+                }
+            }
+            groupToGroups.put(group, reachable);
+        }
     }
 }
