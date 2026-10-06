@@ -40,7 +40,11 @@ public class LlmClient {
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
-        body.put("temperature", 0);
+        if (!model.startsWith("gpt-5")) {
+            // 0 makes the reply as repeatable as possible. The gpt-5 models
+            // only accept their default temperature, so it is left out for them.
+            body.put("temperature", 0);
+        }
         body.put("messages", List.of(
                 Map.of("role", "system", "content", systemPrompt),
                 Map.of("role", "user", "content", userMessage)));
