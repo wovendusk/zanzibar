@@ -39,20 +39,34 @@ public final class Prompts {
             {
               "namespaces": [
                 { "name": "<object type>",
-                  "relations": { "<relation name>": <rule>, ... } }
+                  "relations": {
+                    "<relation name>": { "means": "<one sentence>", "rule": <rule> },
+                    ... } }
               ],
               "tuples": [ "<object>#<relation>@<subject>", ... ]
             }
 
+            Write "means" before "rule". It is one plain sentence that says who has the
+            relation: whether people are assigned to it directly, and every other
+            relation it includes or excludes. Every statement in the policy about a
+            relation must show up in that relation's "means", and the "rule" must say
+            exactly what "means" says.
+
             A <rule> must be exactly one of these six building blocks:
 
-            1. {"type": "this"}
-               Whoever is listed directly in tuples for this relation.
+            1. {"type": "direct"}
+               The people or groups assigned to the relation being defined, by tuples
+               written for that relation itself.
+               "direct" never refers to any other relation.
             2. {"type": "computed_userset", "relation": "<other relation>"}
-               Everyone who has <other relation> on the same object.
+               Everyone who has <other relation> on the same object. This is the only
+               way to refer to another relation of the same object, such as "member",
+               "editor" or "banned".
                Example: editors are also viewers.
-            3. {"type": "tuple_to_userset", "tupleset": "<link relation>", "computed": "<relation>"}
+            3. {"type": "tuple_to_userset", "tupleset": "<link relation>",
+                "target": "<namespace the link leads to>", "computed": "<relation>"}
                Follow <link relation> to another object and take <relation> there.
+               <relation> must be a relation of the target namespace, not of this one.
                Example: viewers of the parent folder are viewers of the document.
             4. {"type": "union", "children": [<rule>, ...]}
                Granted if any child grants.
@@ -61,6 +75,25 @@ public final class Prompts {
             6. {"type": "exclusion", "base": <rule>, "subtract": <rule>}
                Granted by base unless subtract also grants.
 
+            How to write the rule for one relation R. Ask two questions:
+            a) Can people or groups be assigned to R itself? If yes, the rule contains
+               {"type": "direct"}. If R is worked out only from other relations
+               ("readers are the members who are not banned", "nobody is assigned
+               reader directly"), the rule must not contain {"type": "direct"} anywhere.
+            b) Which other relations does R depend on? Each one appears as a
+               computed_userset (same object) or a tuple_to_userset (another object),
+               named explicitly.
+
+            A common mistake, for "readers are the members who are not banned":
+              WRONG: {"type": "exclusion", "base": {"type": "direct"},
+                      "subtract": {"type": "computed_userset", "relation": "banned"}}
+                     Here "direct" means people assigned reader, not the members.
+              RIGHT: {"type": "exclusion",
+                      "base": {"type": "computed_userset", "relation": "member"},
+                      "subtract": {"type": "computed_userset", "relation": "banned"}}
+            The same applies inside an intersection and to the subtract side: name the
+            other relation with computed_userset, never with "direct".
+
             Constraints:
             - Use only these six building blocks. Do not invent other types or fields.
             - Every relation named in a computed_userset, or as the tupleset of a
@@ -68,13 +101,12 @@ public final class Prompts {
             - "relation", "tupleset" and "computed" are plain relation names such as
               "parent" or "member". They never contain ":" or "#".
             - To link an object to another object (a page to its project, a document
-              to its folder), give it a link relation of type "this", for example
+              to its folder), give it a link relation of type "direct", for example
               "project" or "parent", and use that as the tupleset.
-            - "X are also Y" means Y is a union containing a computed_userset of X.
+            - "X are also Y" changes the rule of Y, not of X: Y is a union that
+              contains a computed_userset of X. X itself stays as it was.
             - "unless", "except" or "but not" means an exclusion.
-            - A relation that people or groups are assigned to directly needs {"type": "this"},
-              on its own or inside a union.
-            - Groups are a namespace "group" with a relation "member" of type "this".
+            - Groups are a namespace "group" with a relation "member" of type "direct".
               A whole group as a subject is written "group:<name>#member".
             - "tuples" lists example tuples that put the policy into effect, such as
               "folder:engineering#viewer@group:engineers#member" or
@@ -85,13 +117,20 @@ public final class Prompts {
 
             {
               "namespaces": [
-                { "name": "group", "relations": { "member": {"type": "this"} } },
-                { "name": "folder", "relations": { "viewer": {"type": "this"} } },
+                { "name": "group", "relations": {
+                    "member": { "means": "People assigned as members directly.",
+                                "rule": {"type": "direct"} } } },
+                { "name": "folder", "relations": {
+                    "viewer": { "means": "People or groups assigned as viewers directly.",
+                                "rule": {"type": "direct"} } } },
                 { "name": "doc", "relations": {
-                    "parent": {"type": "this"},
-                    "viewer": {"type": "union", "children": [
-                      {"type": "this"},
-                      {"type": "tuple_to_userset", "tupleset": "parent", "computed": "viewer"} ]} } }
+                    "parent": { "means": "The folder assigned as this document's parent.",
+                                "rule": {"type": "direct"} },
+                    "viewer": { "means": "People assigned directly, plus the viewers of the parent folder.",
+                                "rule": {"type": "union", "children": [
+                                  {"type": "direct"},
+                                  {"type": "tuple_to_userset", "tupleset": "parent",
+                                   "target": "folder", "computed": "viewer"} ]} } } }
               ],
               "tuples": [
                 "folder:engineering#viewer@group:engineers#member",
@@ -105,18 +144,23 @@ public final class Prompts {
 
             {
               "namespaces": [
-                { "name": "group", "relations": { "member": {"type": "this"} } },
                 { "name": "repo", "relations": {
-                    "maintainer": {"type": "this"},
-                    "contributor": {"type": "union", "children": [
-                      {"type": "this"},
-                      {"type": "computed_userset", "relation": "maintainer"} ]} } },
+                    "maintainer": { "means": "People assigned as maintainers directly.",
+                                    "rule": {"type": "direct"} },
+                    "contributor": { "means": "People assigned directly, plus all maintainers.",
+                                     "rule": {"type": "union", "children": [
+                                       {"type": "direct"},
+                                       {"type": "computed_userset", "relation": "maintainer"} ]} } } },
                 { "name": "issue", "relations": {
-                    "repo": {"type": "this"},
-                    "blocked": {"type": "this"},
-                    "reader": {"type": "exclusion",
-                      "base": {"type": "tuple_to_userset", "tupleset": "repo", "computed": "contributor"},
-                      "subtract": {"type": "computed_userset", "relation": "blocked"} } } }
+                    "repo": { "means": "The repo assigned as this issue's repo.",
+                              "rule": {"type": "direct"} },
+                    "blocked": { "means": "People assigned as blocked directly.",
+                                 "rule": {"type": "direct"} },
+                    "reader": { "means": "Contributors of the issue's repo, minus the blocked people. Nobody is assigned directly.",
+                                "rule": {"type": "exclusion",
+                                  "base": {"type": "tuple_to_userset", "tupleset": "repo",
+                                           "target": "repo", "computed": "contributor"},
+                                  "subtract": {"type": "computed_userset", "relation": "blocked"} } } } }
               ],
               "tuples": [
                 "issue:42#repo@repo:engine",

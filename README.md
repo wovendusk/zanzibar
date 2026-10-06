@@ -15,7 +15,7 @@ Java 21, Spring Boot 3.4, Apache Kafka, PostgreSQL.
 | Tuple | `object#relation@subject`, e.g. `doc:readme#viewer@user:alice` |
 | Userset | A subject that is a set, e.g. `group:eng#member` (all members of group eng) |
 | Namespace config | For one object type, the relations it has and a rewrite rule for each |
-| Rewrite rule | One of `this`, `computed_userset`, `tuple_to_userset`, `union`, `intersection`, `exclusion` |
+| Rewrite rule | One of `this` (written `direct` in JSON configs), `computed_userset`, `tuple_to_userset`, `union`, `intersection`, `exclusion` |
 | Revision | A number that increases with every write; the store can be read as of any revision |
 | Zookie | The revision a write was applied at, returned to the client |
 
@@ -125,9 +125,18 @@ The model never makes an access decision.
   if it is rejected, the reason is sent back to the model for another attempt
   (three at most). Only a config that passes validation can be installed.
 
+For each relation the model first writes a one-sentence `means` and then the
+rule, and each link to another object names its `target` namespace, which the
+validator checks. The paper's `this` rule is called `direct` in the JSON,
+because models read "this" as "the relation just mentioned".
+
 Validation guarantees a config is well formed. It cannot tell whether a
 well-formed config means what the author intended, so a compiled config should
 be read before it is installed.
+
+Measured on 16 policies, each compiled, installed and then verified with real
+checks against the engine: gpt-4o and gpt-5-mini produced a correct config for
+all 16; gpt-4o-mini for 14.
 
 ## Running it
 
